@@ -171,11 +171,39 @@
         .clear-btn:hover {
             background: #777;
         }
+
+        .voice-btn {
+            background: #28a745;
+            min-width: 48px;
+            padding: 12px 14px;
+            border-radius: 8px;
+        }
+
+        .voice-btn:hover {
+            background: #1f8f3d;
+        }
+
+        .voice-btn.listening {
+            background: #dc3545;
+            animation: pulse 1.2s infinite;
+        }
         
         .typing-indicator {
             display: flex;
             gap: 4px;
             align-items: center;
+        }
+
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(220, 53, 69, 0.6);
+            }
+            70% {
+                box-shadow: 0 0 0 12px rgba(220, 53, 69, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(220, 53, 69, 0);
+            }
         }
         
         .typing-dot {
@@ -239,6 +267,7 @@
                     required
                 >
                 <button type="submit" id="sendBtn">Send</button>
+                <button type="button" class="voice-btn" id="voiceBtn" aria-label="Voice input">🎤</button>
             </form>
             <button type="button" class="clear-btn" onclick="clearChat()">Clear</button>
         </div>
@@ -303,12 +332,38 @@
         }
 
         function normalizeApiResponse(data) {
-            return {
+            const normalized = {
                 success: data && (data.SUCCESS !== undefined ? data.SUCCESS : data.success),
                 results: data && (data.RESULTS !== undefined ? data.RESULTS : data.results),
                 error: data && (data.ERROR !== undefined ? data.ERROR : data.error),
-                message: data && (data.MESSAGE !== undefined ? data.MESSAGE : data.message)
+                message: data && (data.MESSAGE !== undefined ? data.MESSAGE : data.message),
+                answer: data && (data.ANSWER !== undefined ? data.ANSWER : data.answer)
             };
+
+            if (!normalized.answer && normalized.message) {
+                normalized.answer = normalized.message;
+            }
+
+            return normalized;
+        }
+
+        function speakText(text) {
+            if (!('speechSynthesis' in window)) {
+                console.warn('Speech synthesis not supported in this browser.');
+                return;
+            }
+
+            window.speechSynthesis.cancel();
+            const utterance = new SpeechSynthesisUtterance(text);
+            const voices = window.speechSynthesis.getVoices();
+            if (voices.length > 0) {
+                const preferredVoice = voices.find(voice => /en-US|en_US|English/i.test(voice.lang)) || voices[0];
+                utterance.voice = preferredVoice;
+            }
+            utterance.rate = 1;
+            utterance.pitch = 1;
+            utterance.volume = 1;
+            window.speechSynthesis.speak(utterance);
         }
 
         function handleSubmit(event) {
@@ -322,9 +377,9 @@
                 input.value = '';
                 
                 sendBtn.disabled = true;
-                sendBtn.textContent = 'Searching...';
+                sendBtn.textContent = 'Thinking...';
                 
-                fetch('/api/chatAPI.cfm', {
+                fetch('/api/chatAPI_agent.cfm', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -339,12 +394,11 @@
                 })
                 .then(data => {
                     const response = normalizeApiResponse(data);
-console.log(response);
                     if (response.success) {
-                        const formatted = formatSearchResults(response.results);
-                        addMessage('assistant', formatted);
+                        const assistantText = response.answer || response.message || formatSearchResults(response.results);
+                        addMessage('assistant', assistantText);
+                        speakText(assistantText);
                     } else {
-                        console.log(response);
                         addMessage('assistant', 'Error: ' + (response.error || response.message || 'Unknown error'));
                     }
                 })
@@ -373,10 +427,100 @@ console.log(response);
             container.scrollTop = container.scrollHeight;
         }
 
+        const voiceBtn = document.getElementById('voiceBtn');
+        let recognition = null;
+        let pendingVoiceText = '';
+
+        function submitVoiceMessage() {
+            const input = document.getElementById('messageInput');
+            const chatForm = document.getElementById('chatForm');
+            const sendBtn = document.getElementById('sendBtn');
+
+            if (!pendingVoiceText || !input || !chatForm || sendBtn.disabled) {
+                return;
+            }
+
+            const message = pendingVoiceText.trim();
+            if (!message) {
+                pendingVoiceText = '';
+                return;
+            }
+
+            input.value = message;
+            pendingVoiceText = '';
+
+            if (typeof chatForm.requestSubmit === 'function') {
+                chatForm.requestSubmit();
+            } else {
+                chatForm.dispatchEvent(new Event('submit', { cancelable: true }));
+            }
+        }
+
+        function setupSpeechRecognition() {
+            const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!SpeechRecognition) {
+                voiceBtn.title = 'Speech recognition is not supported in this browser';
+                voiceBtn.disabled = true;
+                return;
+            }
+
+            recognition = new SpeechRecognition();
+            recognition.lang = 'en-US';
+            recognition.continuous = false;
+            recognition.interimResults = false;
+
+            recognition.onstart = () => {
+                voiceBtn.classList.add('listening');
+                voiceBtn.textContent = '🔴';
+                pendingVoiceText = '';
+            };
+
+            recognition.onend = () => {
+                voiceBtn.classList.remove('listening');
+                voiceBtn.textContent = '🎤';
+
+                if (pendingVoiceText && pendingVoiceText.trim()) {
+                    setTimeout(submitVoiceMessage, 250);
+                }
+            };
+
+            recognition.onresult = (event) => {
+                const finalTranscript = Array.from(event.results)
+                    .filter(result => result.isFinal)
+                    .map(result => result[0].transcript)
+                    .join(' ')
+                    .trim();
+
+                if (finalTranscript) {
+                    pendingVoiceText = finalTranscript;
+                    const input = document.getElementById('messageInput');
+                    input.value = finalTranscript;
+                    input.focus();
+                }
+            };
+
+            recognition.onerror = (event) => {
+                console.error('Speech recognition error:', event.error);
+                if (event.error !== 'no-speech') {
+                    alert('Speech recognition failed: ' + event.error);
+                }
+            };
+
+            voiceBtn.addEventListener('click', () => {
+                if (voiceBtn.classList.contains('listening')) {
+                    recognition.stop();
+                    return;
+                }
+
+                recognition.start();
+            });
+        }
+
         // Initialize on load
         document.addEventListener('DOMContentLoaded', () => {
             renderMessages();
             document.getElementById('messageInput').focus();
+            setupSpeechRecognition();
         });
     </script>
 </body>
